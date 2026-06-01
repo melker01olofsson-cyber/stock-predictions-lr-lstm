@@ -1,0 +1,504 @@
+---
+title: "Stock Predictions using Linear Regression and LSTM"
+format:
+  html:
+    toc: true
+    code-fold: true
+    code-tools: true
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+## 1 Data Preparation
+
+```{r}
+# Packages
+library(quantmod)
+library(dplyr)
+library(ggplot2)
+library(zoo)
+library(tidyr)
+library(scales)
+library(reticulate)
+library(keras)
+
+# Download SPY data from Yahoo Finance
+symbol <- "SPY"
+start_date <- "2000-01-01"
+
+getSymbols(symbol, src = "yahoo", from = start_date, auto.assign = TRUE)
+
+spy_raw <- get(symbol)
+head(spy_raw)
+tail(spy_raw)
+```
+
+## 2 Feature Engineering
+
+```{r}
+# Convert xts object to data frame
+spy <- data.frame(
+  date = index(spy_raw),
+  coredata(spy_raw)
+)
+
+# Rename columns
+colnames(spy) <- c(
+  "date",
+  "open",
+  "high",
+  "low",
+  "close",
+  "volume",
+  "adjusted"
+)
+
+# Create returns, rolling volatility and next-day close
+spy <- spy %>%
+  arrange(date) %>%
+  mutate(
+    return = close / lag(close) - 1,
+    SD = rollapply(return, width = 20, FUN = sd, fill = NA, align = "right"),
+    log_SD = log(SD),
+    close_next = lead(close)
+  ) %>%
+  drop_na()
+
+sum(is.na(spy))
+head(spy)
+```
+
+## 3 Exploratory Analysis
+
+```{r}
+ggplot(spy, aes(x = date, y = close)) +
+  geom_line() +
+  labs(
+    title = "SPY Closing Price",
+    x = "Date",
+    y = "Close Price"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+ggplot(spy, aes(x = date, y = return)) +
+  geom_line() +
+  labs(
+    title = "Daily Returns",
+    x = "Date",
+    y = "Return"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+ggplot(spy, aes(x = date, y = SD)) +
+  geom_line() +
+  labs(
+    title = "20-Day Rolling Volatility",
+    x = "Date",
+    y = "Rolling Standard Deviation"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+ggplot(spy, aes(x = return)) +
+  geom_histogram(bins = 80) +
+  labs(
+    title = "Distribution of Daily Returns",
+    x = "Return",
+    y = "Frequency"
+  ) +
+  theme_minimal()
+```
+
+## 4 Linear Regression Benchmark
+
+```{r}
+# Expanding window linear regression
+expanding_window_lm <- function(data, initial_window = 250) {
+  predictions <- list()
+
+  for (i in seq(initial_window, nrow(data) - 1)) {
+    train <- data[1:i, ]
+    test <- data[i + 1, ]
+
+    model <- lm(close_next ~ close + volume + return + SD, data = train)
+    pred <- predict(model, newdata = test)
+
+    predictions[[length(predictions) + 1]] <- data.frame(
+      date = test$date,
+      actual = test$close_next,
+      pred = as.numeric(pred),
+      error = test$close_next - as.numeric(pred)
+    )
+  }
+
+  bind_rows(predictions)
+}
+
+# Rolling window linear regression
+rolling_window_lm <- function(data, window = 250) {
+  predictions <- list()
+
+  for (i in seq(window, nrow(data) - 1)) {
+    train <- data[(i - window + 1):i, ]
+    test <- data[i + 1, ]
+
+    model <- lm(close_next ~ close + volume + return + SD, data = train)
+    pred <- predict(model, newdata = test)
+
+    predictions[[length(predictions) + 1]] <- data.frame(
+      date = test$date,
+      actual = test$close_next,
+      pred = as.numeric(pred),
+      error = test$close_next - as.numeric(pred)
+    )
+  }
+
+  bind_rows(predictions)
+}
+
+# Rolling window with log volatility
+rolling_window_lm_log <- function(data, window = 250) {
+  predictions <- list()
+
+  for (i in seq(window, nrow(data) - 1)) {
+    train <- data[(i - window + 1):i, ]
+    test <- data[i + 1, ]
+
+    model <- lm(close_next ~ close + volume + return + log_SD, data = train)
+    pred <- predict(model, newdata = test)
+
+    predictions[[length(predictions) + 1]] <- data.frame(
+      date = test$date,
+      actual = test$close_next,
+      pred = as.numeric(pred),
+      error = test$close_next - as.numeric(pred)
+    )
+  }
+
+  bind_rows(predictions)
+}
+```
+
+```{r}
+# Run models
+pred_expanding <- expanding_window_lm(spy, initial_window = 250)
+pred_rolling <- rolling_window_lm(spy, window = 250)
+pred_rolling_log <- rolling_window_lm_log(spy, window = 250)
+
+# Evaluation functions
+rmse <- function(actual, pred) sqrt(mean((actual - pred)^2, na.rm = TRUE))
+mae <- function(actual, pred) mean(abs(actual - pred), na.rm = TRUE)
+
+directional_accuracy <- function(actual, pred, previous_close) {
+  actual_direction <- sign(actual - previous_close)
+  pred_direction <- sign(pred - previous_close)
+  mean(actual_direction == pred_direction, na.rm = TRUE)
+}
+
+model_results <- data.frame(
+  Model = c("Expanding Window", "Rolling Window", "Rolling Window Log Volatility"),
+  RMSE = c(
+    rmse(pred_expanding$actual, pred_expanding$pred),
+    rmse(pred_rolling$actual, pred_rolling$pred),
+    rmse(pred_rolling_log$actual, pred_rolling_log$pred)
+  ),
+  MAE = c(
+    mae(pred_expanding$actual, pred_expanding$pred),
+    mae(pred_rolling$actual, pred_rolling$pred),
+    mae(pred_rolling_log$actual, pred_rolling_log$pred)
+  )
+)
+
+model_results
+```
+
+```{r}
+ggplot(pred_rolling, aes(x = actual, y = pred)) +
+  geom_point(alpha = 0.4) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+  labs(
+    title = "Rolling Linear Regression: Actual vs Predicted",
+    x = "Actual",
+    y = "Predicted"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+ggplot(pred_rolling, aes(x = date)) +
+  geom_line(aes(y = actual), linewidth = 0.6) +
+  geom_line(aes(y = pred), linewidth = 0.6, linetype = "dashed") +
+  labs(
+    title = "Rolling Linear Regression Predictions",
+    x = "Date",
+    y = "Close Price"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+ggplot(pred_rolling, aes(x = date, y = error)) +
+  geom_line() +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  labs(
+    title = "Rolling Linear Regression Prediction Errors",
+    x = "Date",
+    y = "Prediction Error"
+  ) +
+  theme_minimal()
+```
+
+## 5 LSTM Modeling
+
+```{r}
+# Optional: set Python environment
+# use_virtualenv("r-lstm", required = TRUE)
+
+# Helper function for creating sequences
+create_sequences <- function(x, y, lookback = 20) {
+  n <- nrow(x)
+  X <- array(NA, dim = c(n - lookback, lookback, ncol(x)))
+  Y <- numeric(n - lookback)
+
+  for (i in 1:(n - lookback)) {
+    X[i,,] <- as.matrix(x[i:(i + lookback - 1), ])
+    Y[i] <- y[i + lookback]
+  }
+
+  list(X = X, Y = Y)
+}
+
+# Min-max scaling
+minmax_scale <- function(train, test) {
+  mins <- apply(train, 2, min)
+  maxs <- apply(train, 2, max)
+
+  train_scaled <- sweep(sweep(train, 2, mins, "-"), 2, maxs - mins, "/")
+  test_scaled <- sweep(sweep(test, 2, mins, "-"), 2, maxs - mins, "/")
+
+  list(train = train_scaled, test = test_scaled, mins = mins, maxs = maxs)
+}
+
+# Z-score scaling
+zscore_scale <- function(train, test) {
+  means <- apply(train, 2, mean)
+  sds <- apply(train, 2, sd)
+
+  train_scaled <- sweep(sweep(train, 2, means, "-"), 2, sds, "/")
+  test_scaled <- sweep(sweep(test, 2, means, "-"), 2, sds, "/")
+
+  list(train = train_scaled, test = test_scaled, means = means, sds = sds)
+}
+```
+
+```{r}
+rolling_lstm <- function(data,
+                         window = 200,
+                         lookback = 20,
+                         step = 10,
+                         epochs = 10,
+                         batch_size = 16) {
+
+  features <- c("close", "volume", "return", "SD")
+  predictions <- list()
+
+  for (i in seq(window, nrow(data) - lookback - 1, by = step)) {
+    train <- data[(i - window + 1):i, ]
+    test <- data[(i - lookback + 1):(i + 1), ]
+
+    scaled <- minmax_scale(train[, features], test[, features])
+
+    x_train_raw <- as.data.frame(scaled$train)
+    y_train <- train$close_next
+
+    seq_train <- create_sequences(x_train_raw, y_train, lookback = lookback)
+
+    x_test <- array(
+      as.matrix(as.data.frame(scaled$test[1:lookback, ])),
+      dim = c(1, lookback, length(features))
+    )
+
+    model <- keras_model_sequential() %>%
+      layer_lstm(units = 30, input_shape = c(lookback, length(features))) %>%
+      layer_dropout(rate = 0.2) %>%
+      layer_dense(units = 1)
+
+    model %>% compile(
+      optimizer = optimizer_adam(learning_rate = 0.001),
+      loss = "mse"
+    )
+
+    model %>% fit(
+      seq_train$X,
+      seq_train$Y,
+      epochs = epochs,
+      batch_size = batch_size,
+      verbose = 0
+    )
+
+    pred <- model %>% predict(x_test, verbose = 0)
+
+    predictions[[length(predictions) + 1]] <- data.frame(
+      date = data$date[i + 1],
+      actual = data$close_next[i + 1],
+      pred = as.numeric(pred),
+      error = data$close_next[i + 1] - as.numeric(pred)
+    )
+  }
+
+  bind_rows(predictions)
+}
+
+lstm_predictions <- rolling_lstm(
+  spy,
+  window = 200,
+  lookback = 20,
+  step = 10,
+  epochs = 10,
+  batch_size = 16
+)
+
+head(lstm_predictions)
+tail(lstm_predictions)
+
+mae_lstm <- mae(lstm_predictions$actual, lstm_predictions$pred)
+rmse_lstm <- rmse(lstm_predictions$actual, lstm_predictions$pred)
+
+mae_lstm
+rmse_lstm
+```
+
+```{r}
+ggplot(lstm_predictions, aes(x = actual, y = pred)) +
+  geom_point(alpha = 0.5) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+  labs(
+    title = "LSTM: Actual vs Predicted",
+    x = "Actual",
+    y = "Predicted"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+ggplot(lstm_predictions, aes(x = date)) +
+  geom_line(aes(y = actual), linewidth = 0.6) +
+  geom_line(aes(y = pred), linewidth = 0.6, linetype = "dashed") +
+  labs(
+    title = "LSTM Predictions",
+    x = "Date",
+    y = "Close Price"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+directional_accuracy_lstm <- mean(
+  sign(diff(lstm_predictions$actual)) == sign(diff(lstm_predictions$pred)),
+  na.rm = TRUE
+)
+
+directional_accuracy_lstm
+```
+
+## 5.5 Rolling Window LSTM: 5-Year Model
+
+```{r}
+# Restrict data to most recent five years
+spy_5y <- spy %>%
+  filter(date >= max(date) - 365 * 5)
+
+rolling_lstm_5y <- function(data,
+                            window = 250,
+                            lookback = 20,
+                            epochs = 20,
+                            batch_size = 16) {
+
+  features <- c("close", "volume", "return", "SD")
+  predictions <- list()
+
+  for (i in seq(window, nrow(data) - lookback - 1)) {
+    train <- data[(i - window + 1):i, ]
+    test <- data[(i - lookback + 1):(i + 1), ]
+
+    scaled <- zscore_scale(train[, features], test[, features])
+
+    x_train_raw <- as.data.frame(scaled$train)
+    y_train <- train$close_next
+
+    seq_train <- create_sequences(x_train_raw, y_train, lookback = lookback)
+
+    x_test <- array(
+      as.matrix(as.data.frame(scaled$test[1:lookback, ])),
+      dim = c(1, lookback, length(features))
+    )
+
+    model <- keras_model_sequential() %>%
+      layer_lstm(units = 30, input_shape = c(lookback, length(features))) %>%
+      layer_dropout(rate = 0.2) %>%
+      layer_dense(units = 1)
+
+    model %>% compile(
+      optimizer = optimizer_adam(learning_rate = 0.001),
+      loss = "mse"
+    )
+
+    model %>% fit(
+      seq_train$X,
+      seq_train$Y,
+      epochs = epochs,
+      batch_size = batch_size,
+      verbose = 0
+    )
+
+    pred <- model %>% predict(x_test, verbose = 0)
+
+    predictions[[length(predictions) + 1]] <- data.frame(
+      date = data$date[i + 1],
+      actual = data$close_next[i + 1],
+      pred = as.numeric(pred)
+    )
+  }
+
+  bind_rows(predictions)
+}
+
+lstm_predictions_5y <- rolling_lstm_5y(
+  spy_5y,
+  window = 250,
+  lookback = 20,
+  epochs = 20,
+  batch_size = 16
+)
+
+head(lstm_predictions_5y)
+tail(lstm_predictions_5y)
+```
+
+```{r}
+ggplot(lstm_predictions_5y, aes(x = date)) +
+  geom_line(aes(y = actual), linewidth = 0.6) +
+  geom_line(aes(y = pred), linewidth = 0.6, linetype = "dashed") +
+  labs(
+    title = "5-Year Rolling LSTM Predictions",
+    x = "Date",
+    y = "Close Price"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+mae(lstm_predictions_5y$actual, lstm_predictions_5y$pred)
+rmse(lstm_predictions_5y$actual, lstm_predictions_5y$pred)
+```
+
+## 6 Conclusion
+
+This project compares linear regression and LSTM models for stock price prediction. The linear regression models provide a useful statistical benchmark, while the LSTM models demonstrate how nonlinear sequence models can be applied to financial time-series forecasting. The results should be interpreted cautiously because price-level prediction is strongly influenced by autocorrelation, and directional prediction remains difficult.
