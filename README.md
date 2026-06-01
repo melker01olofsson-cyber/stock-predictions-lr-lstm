@@ -1,5 +1,8 @@
 # Stock Predictions using Linear Regression and LSTM
 
+## HTML Page
+https://melker01olofsson-cyber.github.io/stock-predictions-lr-lstm/
+
 This project compares linear regression and LSTM models for stock price prediction using financial time-series data. The analysis uses SPY data and evaluates different modeling approaches through rolling-window and expanding-window prediction frameworks.
 
 ## Methods
